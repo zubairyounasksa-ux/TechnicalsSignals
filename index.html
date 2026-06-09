@@ -467,7 +467,7 @@ td.note{font-size:14px;color:#bcc8dd;font-style:italic;line-height:1.55;padding-
       <div class="rec-summary" id="rec-summary">No records saved yet.</div>
       <div class="rec-wrap">
         <table class="rec-table">
-          <thead><tr><th>Symbol</th><th>Selected Close</th><th>Previous Targets / SL</th><th>Status</th><th>Price Difference</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Actual Close</th><th>Saved Targets / SL</th><th>Status</th><th>Price Difference</th></tr></thead>
           <tbody id="rec-body"></tbody>
         </table>
       </div>
@@ -631,19 +631,48 @@ async function loadFromSheet() {
       note:s.note, islamic:s.islamic
     }));
 
-    // Merge records
+    // Merge records from Sheet. Sheet is treated as source of truth for matching dates.
     if (snap.records && snap.records.length) {
       const local = loadRecs();
-      const dates = new Set(local.map(r=>r.date));
       const byDate = {};
+
       snap.records.forEach(r => {
-        if (!byDate[r.date]) byDate[r.date] = { id:Date.now()+Math.random(), date:r.date, dateInput:'', savedAt:new Date().toISOString(),
-          kse100:{ closing:r.kseClosing, target1:r.kseTarget1, target2:r.kseTarget2, stoploss:r.kseStoploss }, stocks:[] };
-        if (r.symbol && r.symbol !== 'KSE100') byDate[r.date].stocks.push({ symbol:r.symbol, strategy:r.strategy,
-          close:r.stockClose, target1:r.stockT1, target2:r.stockT2, stoploss:r.stockSL, note:r.note });
+        const d = r.date || '';
+        if (!d) return;
+
+        if (!byDate[d]) {
+          byDate[d] = {
+            id: Date.now() + Math.random(),
+            date: d,
+            dateInput: fmtDateInv(d),
+            savedAt: new Date().toISOString(),
+            kse100: {
+              closing: r.kseClosing,
+              target1: r.kseTarget1,
+              target2: r.kseTarget2,
+              stoploss: r.kseStoploss
+            },
+            stocks: []
+          };
+        }
+
+        if (r.symbol && String(r.symbol).toUpperCase() !== 'KSE100') {
+          byDate[d].stocks.push({
+            symbol: r.symbol,
+            strategy: r.strategy,
+            close: r.stockClose || '',
+            target1: r.stockT1,
+            target2: r.stockT2,
+            stoploss: r.stockSL,
+            note: r.note,
+            islamic: !!r.islamic
+          });
+        }
       });
-      const merged = [...local];
-      Object.values(byDate).forEach(r => { if (!dates.has(r.date)) merged.push(r); });
+
+      const sheetRecords = Object.values(byDate);
+      const sheetDateSet = new Set(sheetRecords.map(r => r.date));
+      const merged = local.filter(r => !sheetDateSet.has(r.date)).concat(sheetRecords);
       merged.sort((a,b)=>new Date(a.dateInput||a.savedAt)-new Date(b.dateInput||b.savedAt));
       saveRecs(merged);
     }
@@ -943,7 +972,7 @@ function getFormRecord(){
     const c=row.querySelector('.sr-cls').value, sym=row.querySelector('.sr-sym').value.trim().toUpperCase();
     if(!sym)return;
     rec.stocks.push({ symbol:sym, strategy:stratLbl(c),
-      close:row.querySelector('.sr-close').value, target1:row.querySelector('.sr-t1').value,
+      close:'', target1:row.querySelector('.sr-t1').value,
       target2:row.querySelector('.sr-t2').value, stoploss:row.querySelector('.sr-sl').value,
       note:row.querySelector('.sr-note').value, islamic:row.querySelector('.sr-islamic').checked });
   });
@@ -980,6 +1009,15 @@ function populateRecDateSel(sel){
   recs.slice().reverse().forEach(r=>{ const o=document.createElement('option');o.value=recKey(r);o.textContent=r.date;if(recKey(r)===cur)o.selected=true;sel.appendChild(o); });
 }
 
+function getSelRecord(key){
+  const recs=loadRecs();
+  if(!recs.length)return{recs,sel:null,si:-1};
+  const k=key||document.getElementById('rec-date-sel').value||recKey(recs[recs.length-1]);
+  let si=recs.findIndex(r=>recKey(r)===k);
+  if(si<0)si=recs.length-1;
+  return{recs,sel:recs[si],si};
+}
+
 function getPrevSel(key){
   const recs=loadRecs(); if(recs.length<2)return{recs,prev:null,sel:null,si:-1};
   const k=key||document.getElementById('rec-date-sel').value||recKey(recs[recs.length-1]);
@@ -990,14 +1028,19 @@ function getPrevSel(key){
 
 function findStock(rec,sym){ return rec&&Array.isArray(rec.stocks)?rec.stocks.find(s=>String(s.symbol||'').toUpperCase()===String(sym||'').toUpperCase())||null:null; }
 
+function escHTML(v){ return String(v==null?'':v).replace(/[&<>"]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m])); }
+function escAttr(v){ return escHTML(v).replace(/'/g,'&#39;'); }
+
 function evalStatus(cl,t1,t2,sl){
   const c=num(cl),a=num(t1),b=num(t2),s=num(sl);
   if(c===null)return'Missing Close'; if(a===null||b===null||s===null)return'Missing Targets';
   if(c>=b)return'Target 2 Hit'; if(c>=a)return'Target 1 Hit'; if(c<=s)return'Stoploss Hit'; return'In Range';
 }
 
-function addTrackRow(lbl,selClose,pt1,pt2,psl,opts){
+function addTrackRow(lbl,stock,opts){
   const tb=document.getElementById('rec-body'); if(!tb)return;
+  const selClose=stock.close||'';
+  const pt1=stock.target1||'', pt2=stock.target2||'', psl=stock.stoploss||'';
   const c=num(selClose),t1=num(pt1),t2=num(pt2),sl=num(psl);
   const st=evalStatus(selClose,pt1,pt2,psl);
   const cls={
@@ -1006,13 +1049,19 @@ function addTrackRow(lbl,selClose,pt1,pt2,psl,opts){
   }[st]||'rfl';
   const pct=c!==null&&t1?((c/t1)*100).toFixed(1)+'%':'-';
   let diff='';
-  if(c===null) diff='<div class="diff-note">Click Fetch Missing Closes to track.</div>';
+  if(c===null) diff='<div class="diff-note">Enter actual close or click Fetch Missing Closes.</div>';
   else if(st==='Target 2 Hit') diff='<div class="diff-note">Above T2: '+fmtSgn(c-t2)+'</div>';
   else if(st==='Target 1 Hit') diff='<div class="diff-note">Above T1: '+fmtSgn(c-t1)+'<br>To T2: '+fmtSgn(c-t2)+'</div>';
   else if(st==='Stoploss Hit')  diff='<div class="diff-note">Below SL: '+fmtSgn(c-sl)+'</div>';
   else diff='<div class="diff-note">To T1: '+fmtSgn(c-t1)+'<br>Above SL: '+fmtSgn(c-sl)+'</div>';
   const tag=opts&&opts.auto?'<span class="rtag">Auto</span>':'';
-  tb.innerHTML+=`<tr><td>${lbl}${tag}</td><td>Close: ${selClose||'-'}</td><td>T1:${pt1||'-'} T2:${pt2||'-'} SL:${psl||'-'}</td><td class="${cls}">${st} (${pct})</td><td>${diff}</td></tr>`;
+  tb.innerHTML+=`<tr>
+    <td>${escHTML(lbl)}${tag}</td>
+    <td><input class="inp rec-close-input" style="width:125px;font-size:13px;padding:7px 10px" value="${escAttr(selClose)}" placeholder="Enter close" onchange="updateCloseForRecord('${escAttr(opts.date)}','${escAttr(lbl)}',this.value)"></td>
+    <td>T1:${escHTML(pt1)||'-'} T2:${escHTML(pt2)||'-'} SL:${escHTML(psl)||'-'}</td>
+    <td class="${cls}">${st} (${pct})</td>
+    <td>${diff}</td>
+  </tr>`;
 }
 
 function renderRecords(key){
@@ -1022,37 +1071,57 @@ function renderRecords(key){
   const sel=document.getElementById('rec-date-sel');
   populateRecDateSel(sel); tb.innerHTML='';
   if(!recs.length){sum.textContent='No records saved yet.';return;}
-  if(recs.length===1){sum.textContent='1 record saved for '+recs[0].date+'. Save another day to compare.';return;}
-  const {prev,sel:S,si}=getPrevSel(key);
+  const {sel:S}=getSelRecord(key);
   if(!S){sum.textContent='No record found.';return;}
   sel.value=recKey(S);
-  if(si===0||!prev){sum.textContent=S.date+' is the first record. No previous date to compare.';return;}
-  const miss=prev.stocks.filter(s=>{ const x=findStock(S,s.symbol); return !x||num(x.close)===null; }).length;
-  sum.textContent='Tracking '+S.date+' vs '+prev.date+' targets. Missing closes: '+miss+'.';
-  addTrackRow('KSE100',S.kse100.closing,prev.kse100.target1,prev.kse100.target2,prev.kse100.stoploss);
-  prev.stocks.forEach(p=>{ const x=findStock(S,p.symbol); addTrackRow(p.symbol,x?x.close:'',p.target1,p.target2,p.stoploss,{auto:!!(x&&x.autoTracked)}); });
+  const missing=S.stocks.filter(s=>num(s.close)===null).length;
+  sum.textContent='Tracking '+S.date+'. Enter actual close prices to update performance. Missing closes: '+missing+'.';
+  if(!S.stocks.length){sum.textContent='No stock calls saved for '+S.date+'.';return;}
+  S.stocks.forEach(st=>addTrackRow(st.symbol,st,{date:S.date,auto:!!st.autoTracked}));
+}
+
+async function updateCloseForRecord(date,symbol,close){
+  const recs=loadRecs();
+  const rec=recs.find(r=>String(r.date).trim()===String(date).trim());
+  if(!rec){status('Local record not found.','err');return;}
+  const stock=findStock(rec,symbol);
+  if(!stock){status('Stock not found in record.','err');return;}
+  stock.close=String(close||'').trim();
+  rec.savedAt=new Date().toISOString();
+  saveRecs(recs);
+  renderRecords(recKey(rec));
+  renderPerf();
+  try{
+    syncDot('busy','Updating close…');
+    await sheetPOST('updateRecordClose',{date:rec.date,symbol:stock.symbol,close:stock.close});
+    syncDot('ok','Close synced');
+    status(stock.symbol+' close updated.','ok');
+  }catch(e){
+    syncDot('err','Close sync failed');
+    status(e.message,'err');
+  }
 }
 
 async function fetchMissing(){
   const btn=document.getElementById('btn-missing');
-  const {recs,prev,sel:S,si}=getPrevSel('');
-  if(!prev||!S||si<=0){status('Select a saved date with a previous record.','err');return;}
-  const missing=[...new Set(prev.stocks.map(s=>String(s.symbol||'').toUpperCase()).filter(sym=>{ if(!sym)return false; const x=findStock(S,sym); return !x||num(x.close)===null; }))];
+  const {recs,sel:S,si}=getSelRecord('');
+  if(!S){status('Select a saved record first.','err');return;}
+  const missing=[...new Set(S.stocks.filter(s=>num(s.close)===null).map(s=>String(s.symbol||'').toUpperCase()).filter(Boolean))];
   if(!missing.length){status('No missing closes.','ok');renderRecords(recKey(S));return;}
   btn.disabled=true; status('Fetching: '+missing.join(', '),'');
   try {
     const r=await callAPI('/api/psx/prices?symbols='+encodeURIComponent(missing.join(',')));
     const failed=[];
-    missing.forEach(sym=>{
-      const cl=r.symbols&&r.symbols[sym]; const ps=findStock(prev,sym);
-      if(!cl||!ps){failed.push(sym);return;}
-      let xs=findStock(S,sym);
-      if(xs){xs.close=cl;xs.autoTracked=true;}
-      else S.stocks.push({symbol:sym,strategy:ps.strategy||'Tracked',close:cl,target1:ps.target1,target2:ps.target2,stoploss:ps.stoploss,note:'Auto-tracked',islamic:!!ps.islamic,autoTracked:true});
-    });
+    for(const sym of missing){
+      const cl=r.symbols&&r.symbols[sym];
+      const st=findStock(S,sym);
+      if(!cl||!st){failed.push(sym);continue;}
+      st.close=cl; st.autoTracked=true;
+      try{ await sheetPOST('updateRecordClose',{date:S.date,symbol:st.symbol,close:cl}); }catch(e){}
+    }
     S.savedAt=new Date().toISOString(); recs[si]=S; saveRecs(recs);
     renderRecords(recKey(S)); renderPerf();
-    status(failed.length?'Done. Failed: '+failed.join(', '):'Missing closes updated.', failed.length?'err':'ok');
+    status(failed.length?'Done. Failed: '+failed.join(', '):'Missing closes updated and synced.', failed.length?'err':'ok');
   } catch(e){status('Fetch failed.','err');}
   finally{btn.disabled=false;}
 }
@@ -1060,11 +1129,10 @@ async function fetchMissing(){
 // ════════════════════════════════════════════════════════════
 //  PERFORMANCE
 // ════════════════════════════════════════════════════════════
-function perfCount(prev,sel){
+function perfCount(rec){
   const st={total:0,t2:0,t1:0,sl:0,range:0,miss:0};
   function add(s){ st.total++; if(s==='Target 2 Hit')st.t2++; else if(s==='Target 1 Hit')st.t1++; else if(s==='Stoploss Hit')st.sl++; else if(s==='In Range')st.range++; else st.miss++; }
-  add(evalStatus(sel.kse100.closing,prev.kse100.target1,prev.kse100.target2,prev.kse100.stoploss));
-  prev.stocks.forEach(p=>{ const x=findStock(sel,p.symbol); add(evalStatus(x?x.close:'',p.target1,p.target2,p.stoploss)); });
+  rec.stocks.forEach(s=>add(evalStatus(s.close,s.target1,s.target2,s.stoploss)));
   return st;
 }
 
@@ -1081,12 +1149,12 @@ function renderPerf(){
   if(pt&&recs.some(r=>recKey(r)===pt))ts.value=pt;
   tb.innerHTML='';
   const zero=()=>{ ['p-total','p-t2','p-t1','p-sl'].forEach(id=>document.getElementById(id).textContent='0'); document.getElementById('p-rm').textContent='0/0'; ['p-t2-r','p-t1-r','p-sl-r'].forEach(id=>document.getElementById(id).textContent='0.0%'); };
-  if(recs.length<2){zero();sum.textContent='Save at least two records.';return;}
-  let fi=fs.value?recs.findIndex(r=>recKey(r)===fs.value):1; let ti=ts.value?recs.findIndex(r=>recKey(r)===ts.value):recs.length-1;
-  if(fi<1)fi=1; if(ti<1)ti=recs.length-1; if(fi>ti){const t=fi;fi=ti;ti=t;}
+  if(!recs.length){zero();sum.textContent='Save at least one record to view performance.';return;}
+  let fi=fs.value?recs.findIndex(r=>recKey(r)===fs.value):0; let ti=ts.value?recs.findIndex(r=>recKey(r)===ts.value):recs.length-1;
+  if(fi<0)fi=0; if(ti<0)ti=recs.length-1; if(fi>ti){const t=fi;fi=ti;ti=t;}
   const tot={total:0,t2:0,t1:0,sl:0,range:0,miss:0};
   for(let i=fi;i<=ti;i++){
-    const s=perfCount(recs[i-1],recs[i]); Object.keys(tot).forEach(k=>tot[k]+=s[k]);
+    const s=perfCount(recs[i]); Object.keys(tot).forEach(k=>tot[k]+=s[k]);
     const hits=s.t1+s.t2; const valid=Math.max(s.total-s.miss,0); const hr=valid?((hits/valid)*100).toFixed(1)+'%':'-';
     tb.innerHTML+=`<tr><td>${recs[i].date}</td><td>${s.total}</td><td class="rup">${s.t2}</td><td class="rup">${s.t1}</td><td class="rdn">${s.sl}</td><td class="rfl">${s.range}</td><td>${s.miss}</td><td class="rup">${hr}</td></tr>`;
   }
